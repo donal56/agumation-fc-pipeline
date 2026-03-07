@@ -1,7 +1,5 @@
-
-/venv*
+/.venv
+/.env.local
 /pipeline
 /.runtime
 /__pycache__
-/argos_models
-/scripts/setup/__pycache__

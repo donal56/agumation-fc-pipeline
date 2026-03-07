@@ -30,30 +30,26 @@ Default setup for Windows (safe route, recommended):
 
 > Note: Change "3.12" with the python version you have instlaled
 
-1.- Create transcription environment:
+1.- Create project virtual environment:
 
-    py -3.12 -m venv venv_transcribe
-    .\venv_transcribe\Scripts\Activate.ps1
+    py -3.12 -m venv .venv
+    .\.venv\Scripts\Activate.ps1
     python -m pip install --upgrade pip
     python -m pip install --only-binary :all: faster-whisper==1.2.1 ctranslate2==4.4.0 setuptools==80.9.0
-    deactivate
 
-2.- Create translation environment:
+2.- Configure DeepL:
 
-    py -3.12 -m venv venv_translate
-    .\venv_translate\Scripts\Activate.ps1
-    python -m pip install --upgrade pip
-    python -m pip install --only-binary :all: ctranslate2==4.4.0 setuptools==80.9.0
-    python -m pip install sentencepiece==0.2.1 sacremoses==0.1.1 packaging
-    python -m pip install argostranslate==1.9.6 --no-deps
-    python .\scripts\setup\install_argos_models.py
-    deactivate
+Create an account in [deepl](https://www.deepl.com) and generate and API key [here](https://www.deepl.com/es/your-account/keys).
+
+Execute:
+
+    Copy-Item .\.env.example .\.env.local
+
+Edit .env.local and set your own key. Uncomment `DEEPL_API_URL` if you have a pro account.
 
 3.- Validate instalation:
 
-    python .\scripts\setup\init_pipeline_dirs.py
-    .\venv_transcribe\Scripts\python.exe .\scripts\setup\validate_transcribe_runtime.py
-    .\venv_translate\Scripts\python.exe .\scripts\setup\validate_translate_runtime.py
+    python init.py
 
 ## Usage
 Place the videos in `/pipeline/0_src`.
@@ -70,10 +66,10 @@ Or run the complete pipeline:
 
     python run_pipeline.py all
 
-Script wrappers for Windows|Unix are available in `/script/wrappers`.
+Script wrappers for Windows|Unix are available in `/wrappers`.
 
 The final videos will be available in `/pipeline/5_output`.
 
 ## Customization
 
-To fork this pipeline to use different language models, download them in [https://www.argosopentech.com/argospm/index/](https://www.argosopentech.com/argospm/index/), make sure to use more spoken languages as a bridge to less spoken ones (e.g. JP -> EN -> SP)
+To adapt translation quality/style, tune DeepL settings in `pipeline.py` (`source_lang`, `target_lang`, or API URL for Free vs Pro accounts).

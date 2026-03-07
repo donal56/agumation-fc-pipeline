@@ -1,14 +1,10 @@
 import os
 import sys
 import subprocess
-import types
-import warnings
-
-warnings.filterwarnings(
-    "ignore",
-    message=r"pkg_resources is deprecated as an API\..*",
-    category=UserWarning,
-)
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 
 PIPELINE_ROOT = "pipeline"
 SRC = os.path.join(PIPELINE_ROOT, "0_src")
@@ -23,6 +19,7 @@ VIDEO_EXT = (".mp4", ".mkv", ".mov", ".webm")
 model = None
 _ja_en = None
 _en_es = None
+_local_env_loaded = False
 
 
 def log_file_status(stage, filename, status, detail=""):
@@ -30,7 +27,35 @@ def log_file_status(stage, filename, status, detail=""):
     print(f"[{stage}] {filename}: {status}{suffix}")
 
 
+def load_local_env():
+    global _local_env_loaded
+    if _local_env_loaded:
+        return
+
+    env_path = os.path.join(os.getcwd(), ".env.local")
+    if not os.path.exists(env_path):
+        _local_env_loaded = True
+        return
+
+    with open(env_path, "r", encoding="utf8") as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+            if (value.startswith("\"") and value.endswith("\"")) or (value.startswith("'") and value.endswith("'")):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+    _local_env_loaded = True
+
+
 def validate_translate_python():
+    load_local_env()
     translate_python = os.environ.get("TRANSLATE_PYTHON", "").strip()
     if not translate_python:
         return True
@@ -68,16 +93,80 @@ def translate_srt(input_path, output_path, translator):
         lines = f.readlines()
 
     out = []
+    text_inputs = []
 
     for line in lines:
-
-        if "-->" in line or line.strip().isdigit() or line.strip() == "":
-            out.append(line)
+        stripped = line.strip()
+        if "-->" in line or stripped.isdigit() or stripped == "":
+            out.append(("meta", line))
         else:
-            out.append(translator.translate(line.strip()) + "\n")
+            text_inputs.append(stripped)
+            out.append(("text", None))
+
+    if hasattr(translator, "translate_many"):
+        translated_texts = translator.translate_many(text_inputs)
+    else:
+        translated_texts = [translator.translate(text) for text in text_inputs]
+
+    text_i = 0
+    rendered = []
+    for entry_type, value in out:
+        if entry_type == "meta":
+            rendered.append(value)
+        else:
+            rendered.append(translated_texts[text_i] + "\n")
+            text_i += 1
 
     with open(output_path, "w", encoding="utf8") as f:
-        f.writelines(out)
+        f.writelines(rendered)
+
+
+class DeepLTranslator:
+    def __init__(self, source_lang, target_lang):
+        load_local_env()
+        self.source_lang = source_lang
+        self.target_lang = target_lang
+        self.api_key = os.environ.get("DEEPL_API_KEY", "").strip()
+        self.api_url = os.environ.get("DEEPL_API_URL", "https://api-free.deepl.com/v2/translate").strip()
+        if not self.api_key:
+            raise RuntimeError("DEEPL_API_KEY is required for TRANSLATE_BACKEND=deepl")
+
+    def _translate(self, texts):
+        data = {
+            "source_lang": self.source_lang,
+            "target_lang": self.target_lang,
+            "text": texts,
+        }
+        payload = urllib.parse.urlencode(data, doseq=True).encode("utf-8")
+        req = urllib.request.Request(
+            self.api_url,
+            data=payload,
+            headers={"Authorization": f"DeepL-Auth-Key {self.api_key}"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as err:
+            body = err.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"DeepL HTTP {err.code}: {body}") from err
+        except urllib.error.URLError as err:
+            raise RuntimeError(f"DeepL connection error: {err}") from err
+
+        parsed = json.loads(raw)
+        translations = parsed.get("translations", [])
+        if len(translations) != len(texts):
+            raise RuntimeError("DeepL response size mismatch")
+        return [item.get("text", "") for item in translations]
+
+    def translate(self, text):
+        return self._translate([text])[0]
+
+    def translate_many(self, texts):
+        if not texts:
+            return []
+        return self._translate(texts)
 
 
 def run_translate_file_worker(direction, input_path, output_path):
@@ -115,72 +204,13 @@ def get_translators():
     if _ja_en is not None and _en_es is not None:
         return _ja_en, _en_es
 
-    # Keep Argos runtime data inside the project to avoid broken user-level config paths.
-    local_config_root = os.path.join(os.getcwd(), ".runtime")
-    os.makedirs(local_config_root, exist_ok=True)
-    os.environ.setdefault("XDG_CONFIG_HOME", local_config_root)
-    os.environ.setdefault("ARGOS_STANZA_AVAILABLE", "1")
-
     try:
-        import argostranslate.translate
-    except OSError as err:
-        print("Error loading Argos runtime (Torch DLL initialization failed).")
-        print("Likely Windows dependency issue in your venv.")
-        print("Try reinstalling CPU wheels:")
-        print("  python -m pip uninstall -y torch torchvision torchaudio")
-        print("  python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio")
-        print(f"Details: {err}")
-        return None, None
-    except ModuleNotFoundError as err:
-        if "stanza" in str(err):
-            # Torch-free fallback: provide a minimal stanza module so argostranslate can import.
-            stanza_stub = types.ModuleType("stanza")
-
-            class _StubPipeline:
-                def __init__(self, *args, **kwargs):
-                    pass
-
-                def __call__(self, text):
-                    return types.SimpleNamespace(sentences=[types.SimpleNamespace(text=text)])
-
-            stanza_stub.Pipeline = _StubPipeline
-            sys.modules["stanza"] = stanza_stub
-            try:
-                import argostranslate.translate
-            except Exception as second_err:
-                print(f"Error importing argostranslate after stanza fallback: {second_err}")
-                return None, None
-            # Continue with normal flow using imported module.
-            langs = argostranslate.translate.get_installed_languages()
-            try:
-                ja = [l for l in langs if l.code == "ja"][0]
-                en = [l for l in langs if l.code == "en"][0]
-                es = [l for l in langs if l.code == "es"][0]
-            except IndexError:
-                print("Error: Required language models not installed. Run setup commands from README.")
-                return None, None
-
-            _ja_en = ja.get_translation(en)
-            _en_es = en.get_translation(es)
-            return _ja_en, _en_es
-        print(f"Error importing argostranslate: {err}")
-        return None, None
+        _ja_en = DeepLTranslator("JA", "EN")
+        _en_es = DeepLTranslator("EN", "ES")
+        return _ja_en, _en_es
     except Exception as err:
-        print(f"Error importing argostranslate: {err}")
+        print(f"Error initializing DeepL translators: {err}")
         return None, None
-
-    langs = argostranslate.translate.get_installed_languages()
-    try:
-        ja = [l for l in langs if l.code == "ja"][0]
-        en = [l for l in langs if l.code == "en"][0]
-        es = [l for l in langs if l.code == "es"][0]
-    except IndexError:
-        print("Error: Required language models not installed. Run setup commands from README.")
-        return None, None
-
-    _ja_en = ja.get_translation(en)
-    _en_es = en.get_translation(es)
-    return _ja_en, _en_es
 
 
 def qc_check_srt(path):
