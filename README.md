@@ -1,5 +1,5 @@
-# Agumation Fan Club Pipeline
-This is a tool to translate videos. It's structured like a pipeline where videos will be consumed in batch and will progress multiple stages. 
+﻿# Agumation Fan Club Pipeline
+This is a tool to translate videos. It's structured like a pipeline where videos will be consumed in batch and will progress multiple stages.
 
 The output is a video with hardcoded subs in spanish and english, the source language is japanese.
 
@@ -37,15 +37,28 @@ Default setup for Windows (safe route, recommended):
     python -m pip install --upgrade pip
     python -m pip install --only-binary :all: faster-whisper==1.2.1 ctranslate2==4.4.0 setuptools==80.9.0
 
-2.- Configure DeepL:
+2.- Configure OpenAI:
 
-Create an account in [deepl](https://www.deepl.com) and generate and API key [here](https://www.deepl.com/es/your-account/keys).
+Create an openAI account and generate your API key [here](https://platform.openai.com/api-keys).
 
 Execute:
 
     Copy-Item .\.env.example .\.env.local
 
-Edit .env.local and set your own key. Uncomment `DEEPL_API_URL` if you have a pro account.
+Edit `.env.local` and set your own key (`OPENAI_API_KEY`).
+
+For custom context, add:
+
+    OPENAI_CONTEXT=The narrator is a woman.
+    # Optional per pair override (selected by source->target language):
+    # OPENAI_CONTEXT_JA_EN=Use formal style
+    # OPENAI_CONTEXT_EN_ES=Use mexican slang
+
+To generate shorter SRT cues during transcription:
+
+    SRT_MAX_CUE_SECONDS=3.0
+    # Optional additional split by text length:
+    # SRT_MAX_CUE_CHARS=0
 
 3.- Validate instalation:
 
@@ -72,4 +85,4 @@ The final videos will be available in `/pipeline/5_output`.
 
 ## Customization
 
-To adapt translation quality/style, tune DeepL settings in `pipeline.py` (`source_lang`, `target_lang`, or API URL for Free vs Pro accounts).
+To adapt translation quality/style, tune OpenAI settings in `.env.local`.

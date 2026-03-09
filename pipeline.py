@@ -1,9 +1,12 @@
-import os
+﻿import os
 import sys
 import subprocess
 import json
+import re
+import time
+import shutil
+import warnings
 import urllib.error
-import urllib.parse
 import urllib.request
 
 PIPELINE_ROOT = "pipeline"
@@ -20,6 +23,14 @@ model = None
 _ja_en = None
 _en_es = None
 _local_env_loaded = False
+
+# Suppress known upstream warning from ctranslate2 importing pkg_resources.
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API\..*",
+    category=UserWarning,
+    module=r"ctranslate2(\..*)?$",
+)
 
 
 def log_file_status(stage, filename, status, detail=""):
@@ -47,7 +58,9 @@ def load_local_env():
             value = value.strip()
             if not key:
                 continue
-            if (value.startswith("\"") and value.endswith("\"")) or (value.startswith("'") and value.endswith("'")):
+            if (value.startswith('"') and value.endswith('"')) or (
+                value.startswith("'") and value.endswith("'")
+            ):
                 value = value[1:-1]
             os.environ.setdefault(key, value)
 
@@ -61,7 +74,9 @@ def validate_translate_python():
         return True
     if not os.path.exists(translate_python):
         print(f"Error: TRANSLATE_PYTHON does not exist: {translate_python}")
-        print("Set TRANSLATE_PYTHON to a valid python.exe path for the translation venv.")
+        print(
+            "Set TRANSLATE_PYTHON to a valid python.exe path for the translation venv."
+        )
         return False
     if not os.path.isfile(translate_python):
         print(f"Error: TRANSLATE_PYTHON is not a file: {translate_python}")
@@ -76,32 +91,203 @@ def format_time(t):
     return f"{h:02}:{m:02}:{s:06.3f}".replace(".", ",")
 
 
+def get_env_float(name, default):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def get_env_int(name, default):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _segment_value(segment, key, fallback=None):
+    if isinstance(segment, dict):
+        return segment.get(key, fallback)
+    return getattr(segment, key, fallback)
+
+
+SENTENCE_END_RE = re.compile(r"[.!?。！？][\"'”」』）\)\]]*$")
+
+
+def _words_text(words):
+    return "".join(_segment_value(word, "word", "") for word in words).strip()
+
+
+def _build_word_chunk(words):
+    if not words:
+        return None
+    start = _segment_value(words[0], "start", 0)
+    end = _segment_value(words[-1], "end", start)
+    return {"start": start, "end": end, "text": _words_text(words)}
+
+
+def _exceeds_limits(words, max_cue_seconds, max_cue_chars):
+    if not words:
+        return False
+    start = _segment_value(words[0], "start", 0)
+    end = _segment_value(words[-1], "end", start)
+    text = _words_text(words)
+    exceeds_duration = max_cue_seconds > 0 and (end - start) > max_cue_seconds
+    exceeds_chars = max_cue_chars > 0 and len(text) > max_cue_chars
+    return exceeds_duration or exceeds_chars
+
+
+def _find_sentence_break(words, max_tail_words=6):
+    if len(words) < 2:
+        return None
+    start_i = max(0, len(words) - 1 - max_tail_words)
+    for i in range(len(words) - 2, start_i - 1, -1):
+        token = _segment_value(words[i], "word", "").strip()
+        if token and SENTENCE_END_RE.search(token):
+            return i + 1
+    return None
+
+
+def split_segments_for_srt(segments, max_cue_seconds, max_cue_chars):
+    if max_cue_seconds <= 0 and max_cue_chars <= 0:
+        return segments
+
+    split = []
+    for segment in segments:
+        words = _segment_value(segment, "words", None) or []
+        if not words:
+            split.append(segment)
+            continue
+
+        chunk_words = []
+        chunk_start = None
+        chunk_end = None
+
+        def flush_chunk():
+            if not chunk_words:
+                return
+            chunk = _build_word_chunk(chunk_words)
+            if chunk is not None:
+                split.append(chunk)
+
+        for word in words:
+            word_start = _segment_value(word, "start", None)
+            word_end = _segment_value(word, "end", None)
+            if word_start is None or word_end is None:
+                continue
+
+            if not chunk_words:
+                chunk_words = [word]
+                chunk_start = word_start
+                chunk_end = word_end
+                continue
+
+            candidate_words = chunk_words + [word]
+            candidate_text = "".join(
+                _segment_value(w, "word", "") for w in candidate_words
+            ).strip()
+            candidate_end = word_end
+            candidate_duration = candidate_end - chunk_start
+
+            exceeds_duration = (
+                max_cue_seconds > 0 and candidate_duration > max_cue_seconds
+            )
+            exceeds_chars = max_cue_chars > 0 and len(candidate_text) > max_cue_chars
+
+            if exceeds_duration or exceeds_chars:
+                break_at = _find_sentence_break(candidate_words)
+                if break_at is not None:
+                    first_words = candidate_words[:break_at]
+                    tail_words = candidate_words[break_at:]
+                    if tail_words and not _exceeds_limits(
+                        first_words, max_cue_seconds, max_cue_chars
+                    ):
+                        first_chunk = _build_word_chunk(first_words)
+                        if first_chunk is not None:
+                            split.append(first_chunk)
+                        chunk_words = tail_words
+                        chunk_start = _segment_value(chunk_words[0], "start", None)
+                        chunk_end = _segment_value(chunk_words[-1], "end", None)
+                        continue
+
+                flush_chunk()
+                chunk_words = [word]
+                chunk_start = word_start
+                chunk_end = word_end
+            else:
+                chunk_words = candidate_words
+                chunk_end = candidate_end
+
+        flush_chunk()
+
+    return split
+
+
 def write_srt(segments, path):
 
     with open(path, "w", encoding="utf8") as f:
 
         for i, seg in enumerate(segments, 1):
+            start = _segment_value(seg, "start", 0)
+            end = _segment_value(seg, "end", start)
+            text = _segment_value(seg, "text", "")
 
             f.write(str(i) + "\n")
-            f.write(format_time(seg.start) + " --> " + format_time(seg.end) + "\n")
-            f.write(seg.text.strip() + "\n\n")
+            f.write(format_time(start) + " --> " + format_time(end) + "\n")
+            f.write(str(text).strip() + "\n\n")
 
 
 def translate_srt(input_path, output_path, translator):
+    with open(input_path, "r", encoding="utf8") as f:
+        source_srt = f.read()
+
+    if hasattr(translator, "translate_full_srt"):
+        translated_srt = translator.translate_full_srt(source_srt)
+        validate_srt_timemarks(source_srt, translated_srt)
+        with open(output_path, "w", encoding="utf8") as f:
+            f.write(translated_srt.rstrip() + "\n")
+        return
 
     with open(input_path, "r", encoding="utf8") as f:
         lines = f.readlines()
 
     out = []
     text_inputs = []
+    i = 0
 
-    for line in lines:
-        stripped = line.strip()
-        if "-->" in line or stripped.isdigit() or stripped == "":
-            out.append(("meta", line))
-        else:
-            text_inputs.append(stripped)
+    # Translate subtitle cues as blocks to preserve context and intent better.
+    while i < len(lines):
+        is_cue_start = (
+            i + 1 < len(lines) and lines[i].strip().isdigit() and "-->" in lines[i + 1]
+        )
+
+        if not is_cue_start:
+            out.append(("meta", lines[i]))
+            i += 1
+            continue
+
+        out.append(("meta", lines[i]))  # cue index
+        out.append(("meta", lines[i + 1]))  # time range
+        i += 2
+
+        cue_text_lines = []
+        while i < len(lines) and lines[i].strip() != "":
+            cue_text_lines.append(lines[i].rstrip("\n"))
+            i += 1
+
+        if cue_text_lines:
+            text_inputs.append("\n".join(cue_text_lines))
             out.append(("text", None))
+
+        if i < len(lines) and lines[i].strip() == "":
+            out.append(("meta", lines[i]))
+            i += 1
 
     if hasattr(translator, "translate_many"):
         translated_texts = translator.translate_many(text_inputs)
@@ -114,59 +300,221 @@ def translate_srt(input_path, output_path, translator):
         if entry_type == "meta":
             rendered.append(value)
         else:
-            rendered.append(translated_texts[text_i] + "\n")
+            translated = translated_texts[text_i].rstrip("\n")
+            rendered.append(translated + "\n")
             text_i += 1
 
     with open(output_path, "w", encoding="utf8") as f:
         f.writelines(rendered)
 
 
-class DeepLTranslator:
+SRT_TIMEMARK_RE = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3}\s-->\s\d{2}:\d{2}:\d{2},\d{3}$")
+
+
+def extract_srt_timemarks(srt_text):
+    timemarks = []
+    for line in srt_text.splitlines():
+        stripped = line.strip()
+        if "-->" in stripped:
+            timemarks.append(stripped)
+    return timemarks
+
+
+def validate_srt_timemarks(source_srt, translated_srt):
+    source_timemarks = extract_srt_timemarks(source_srt)
+    translated_timemarks = extract_srt_timemarks(translated_srt)
+
+    if len(source_timemarks) != len(translated_timemarks):
+        raise RuntimeError(
+            f"Timestamp count mismatch after translation: expected {len(source_timemarks)}, got {len(translated_timemarks)}"
+        )
+
+    for i, (src, dst) in enumerate(
+        zip(source_timemarks, translated_timemarks), start=1
+    ):
+        if not SRT_TIMEMARK_RE.match(dst):
+            raise RuntimeError(f"Invalid timestamp format in translated cue {i}: {dst}")
+        if src != dst:
+            raise RuntimeError(f"Timestamp changed in cue {i}: '{src}' -> '{dst}'")
+
+
+class OpenAITranslator:
+    @staticmethod
+    def _normalize_lang_code(lang):
+        value = (lang or "").strip().upper()
+        aliases = {
+            "JAPANESE": "JA",
+            "JPN": "JA",
+            "ENGLISH": "EN",
+            "ENG": "EN",
+            "SPANISH": "ES",
+            "SPA": "ES",
+        }
+        return aliases.get(value, value)
+
+    @classmethod
+    def _resolve_role_context(cls, source_lang, target_lang):
+        source_code = cls._normalize_lang_code(source_lang)
+        target_code = cls._normalize_lang_code(target_lang)
+        pair_key = f"{source_code}_{target_code}"
+        base_context = os.environ.get("OPENAI_CONTEXT", "").strip()
+        pair_context = os.environ.get(f"OPENAI_CONTEXT_{pair_key}", "").strip()
+        return " ".join(part for part in [base_context, pair_context] if part)
+
     def __init__(self, source_lang, target_lang):
         load_local_env()
-        self.source_lang = source_lang
-        self.target_lang = target_lang
-        self.api_key = os.environ.get("DEEPL_API_KEY", "").strip()
-        self.api_url = os.environ.get("DEEPL_API_URL", "https://api-free.deepl.com/v2/translate").strip()
+        self.source_lang = self._normalize_lang_code(source_lang)
+        self.target_lang = self._normalize_lang_code(target_lang)
+        self.api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        self.api_url = "https://api.openai.com/v1/responses"
+        self.model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini").strip()
+        self.timeout = 20
+        self.max_retries = 3
+        self.retry_base_seconds = 2
+        self.role_context = self._resolve_role_context(
+            self.source_lang, self.target_lang
+        )
         if not self.api_key:
-            raise RuntimeError("DEEPL_API_KEY is required for TRANSLATE_BACKEND=deepl")
+            raise RuntimeError("OPENAI_API_KEY is required for translation")
 
-    def _translate(self, texts):
-        data = {
-            "source_lang": self.source_lang,
-            "target_lang": self.target_lang,
-            "text": texts,
-        }
-        payload = urllib.parse.urlencode(data, doseq=True).encode("utf-8")
+    @staticmethod
+    def _extract_openai_error_message(body):
+        if not body:
+            return ""
+        try:
+            payload = json.loads(body)
+            err = payload.get("error", {})
+            if isinstance(err, dict):
+                msg = err.get("message")
+                err_type = err.get("type")
+                if msg and err_type:
+                    return f"{err_type}: {msg}"
+                if msg:
+                    return str(msg)
+        except Exception:
+            pass
+        return " ".join(body.split())
+
+    def _translate_full_srt(self, srt_text):
+        system_prompt = (
+            f"You translate subtitles from {self.source_lang} to {self.target_lang}. "
+            "Return valid SRT only. Keep all cue indexes and timestamp lines exactly unchanged. "
+            "Only translate subtitle text. Preserve line breaks per cue when possible. "
+            "Prioritize natural speech over direct translations. "
+            "The input may contain errors, feel free to make corrections if they're minimal."
+            "If there is a figure of speech/untranslatable phrase, make an interpretation that keeps the intention and tone of the original."
+        )
+        if self.role_context:
+            system_prompt += f" Context: {self.role_context}"
+
+        if self.api_url.rstrip("/").endswith("/chat/completions"):
+            body_data = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": srt_text},
+                ],
+            }
+        else:
+            body_data = {
+                "model": self.model,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": system_prompt}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": srt_text}],
+                    },
+                ],
+            }
+        payload = json.dumps(body_data).encode("utf-8")
         req = urllib.request.Request(
             self.api_url,
             data=payload,
-            headers={"Authorization": f"DeepL-Auth-Key {self.api_key}"},
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
             method="POST",
         )
 
-        try:
-            with urllib.request.urlopen(req, timeout=60) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as err:
-            body = err.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"DeepL HTTP {err.code}: {body}") from err
-        except urllib.error.URLError as err:
-            raise RuntimeError(f"DeepL connection error: {err}") from err
+        attempts = self.max_retries + 1
+        raw = None
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                    raw = response.read().decode("utf-8")
+                break
+            except urllib.error.HTTPError as err:
+                body = err.read().decode("utf-8", errors="replace")
+                message = self._extract_openai_error_message(body)
+                should_retry = err.code == 429 or 500 <= err.code <= 599
+                if should_retry and attempt < attempts:
+                    retry_after = 0
+                    try:
+                        retry_after = int(err.headers.get("Retry-After", "0"))
+                    except Exception:
+                        retry_after = 0
+                    wait_seconds = retry_after or (
+                        self.retry_base_seconds * (2 ** (attempt - 1))
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                raise RuntimeError(f"OpenAI HTTP {err.code}: {message}") from err
+            except urllib.error.URLError as err:
+                should_retry = attempt < attempts
+                if should_retry:
+                    wait_seconds = self.retry_base_seconds * (2 ** (attempt - 1))
+                    time.sleep(wait_seconds)
+                    continue
+                raise RuntimeError(f"OpenAI connection error: {err}") from err
+
+        if raw is None:
+            raise RuntimeError("OpenAI request failed before receiving any response")
 
         parsed = json.loads(raw)
-        translations = parsed.get("translations", [])
-        if len(translations) != len(texts):
-            raise RuntimeError("DeepL response size mismatch")
-        return [item.get("text", "") for item in translations]
+        output_text = parsed.get("output_text", "")
+        if output_text:
+            return output_text
+
+        if "choices" in parsed:
+            choices = parsed.get("choices", [])
+            if choices:
+                message = choices[0].get("message", {})
+                content = message.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    return content
+                if isinstance(content, list):
+                    chunks = []
+                    for part in content:
+                        if isinstance(part, dict):
+                            text_part = part.get("text")
+                            if isinstance(text_part, str):
+                                chunks.append(text_part)
+                    joined = "".join(chunks).strip()
+                    if joined:
+                        return joined
+
+        output = parsed.get("output", [])
+        chunks = []
+        for item in output:
+            for content in item.get("content", []):
+                text_value = content.get("text")
+                if isinstance(text_value, str):
+                    chunks.append(text_value)
+        combined = "".join(chunks).strip()
+        if combined:
+            return combined
+
+        raise RuntimeError("OpenAI response did not include translatable output_text")
+
+    def translate_full_srt(self, srt_text):
+        return self._translate_full_srt(srt_text)
 
     def translate(self, text):
-        return self._translate([text])[0]
-
-    def translate_many(self, texts):
-        if not texts:
-            return []
-        return self._translate(texts)
+        return self._translate_full_srt(text)
 
 
 def run_translate_file_worker(direction, input_path, output_path):
@@ -180,6 +528,40 @@ def run_translate_file_worker(direction, input_path, output_path):
         output_path,
     ]
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+
+def summarize_worker_failure(result):
+    combined = "\n".join([result.stderr or "", result.stdout or ""]).strip()
+    if not combined:
+        return f"worker exit code {result.returncode}"
+
+    # Prefer the explicit worker error line when present.
+    for line in reversed(combined.splitlines()):
+        line = line.strip()
+        if line.startswith("Worker translation error:"):
+            return line
+        if line.startswith("Error initializing OpenAI translators:"):
+            return line
+
+    # Extract a compact OpenAI API error message if output is JSON.
+    start = combined.find("{")
+    end = combined.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            payload = json.loads(combined[start : end + 1])
+            err = payload.get("error", {})
+            if isinstance(err, dict):
+                msg = err.get("message")
+                err_type = err.get("type")
+                if msg and err_type:
+                    return f"OpenAI error ({err_type}): {msg}"
+                if msg:
+                    return f"OpenAI error: {msg}"
+        except Exception:
+            pass
+
+    lines = [line.strip() for line in combined.splitlines() if line.strip()]
+    return lines[-1] if lines else f"worker exit code {result.returncode}"
 
 
 def worker_translate_file(direction, input_path, output_path):
@@ -205,11 +587,11 @@ def get_translators():
         return _ja_en, _en_es
 
     try:
-        _ja_en = DeepLTranslator("JA", "EN")
-        _en_es = DeepLTranslator("EN", "ES")
+        _ja_en = OpenAITranslator("JA", "EN")
+        _en_es = OpenAITranslator("EN", "ES")
         return _ja_en, _en_es
     except Exception as err:
-        print(f"Error initializing DeepL translators: {err}")
+        print(f"Error initializing OpenAI translators: {err}")
         return None, None
 
 
@@ -260,35 +642,94 @@ def qc_check_srt(path):
 
 
 def hardsub(video, srt1, srt2, out):
+    def escape_filter_value(path):
+        # FFmpeg filtergraph escaping (not shell escaping).
+        normalized = path.replace("\\", "/")
+        escaped = []
+        for ch in normalized:
+            if ch in "\\':,;[]":
+                escaped.append("\\" + ch)
+            else:
+                escaped.append(ch)
+        return "".join(escaped)
+
+    tmp_dir = os.path.join(".runtime", "hardsub_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    token = f"{int(time.time() * 1000)}_{os.getpid()}"
+    srt1_tmp = os.path.join(tmp_dir, f"top_{token}.srt")
+    srt2_tmp = os.path.join(tmp_dir, f"bottom_{token}.srt")
+    shutil.copyfile(srt1, srt1_tmp)
+    shutil.copyfile(srt2, srt2_tmp)
+
+    srt1_escaped = escape_filter_value(srt1_tmp)
+    srt2_escaped = escape_filter_value(srt2_tmp)
+    top_style = "Fontname=Calibri,PrimaryColour=&HFFFFFF&,Fontsize=21,Alignment=6"
+    bottom_style = "Fontname=Calibri,PrimaryColour=&HFFFFFF&,Fontsize=21"
+    filter_complex = (
+        f"[0]subtitles=filename='{srt1_escaped}':force_style='{top_style}'[a]; "
+        f"[a]subtitles=filename='{srt2_escaped}':force_style='{bottom_style}'"
+    )
 
     cmd = [
         "ffmpeg",
         "-y",
         "-i",
         video,
+        "-v",
+        "error",
+        "-stats",
         "-filter_complex",
-        f"[0]subtitles={srt1}:force_style='Fontname=Calibri,PrimaryColour=&HFFFFFF&,Fontsize=21,Alignment=6'[a]; [a]subtitles={srt2}:force_style='Fontname=Calibri,PrimaryColour=&HFFFFFF&,Fontsize=21'",
+        filter_complex,
         out,
     ]
 
-    result = subprocess.run(cmd, check=False)
-    return result.returncode == 0
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    finally:
+        for tmp_path in (srt1_tmp, srt2_tmp):
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+    if result.returncode == 0:
+        return True, ""
+
+    combined = "\n".join([result.stderr or "", result.stdout or ""]).strip()
+    lines = [line.strip() for line in combined.splitlines() if line.strip()]
+    detail = lines[-1] if lines else "ffmpeg returned non-zero"
+    return False, detail
 
 
 def stage_transcribe():
 
     print("\nSTAGE: TRANSCRIBE\n")
     global model
+    load_local_env()
+    max_cue_seconds = max(0.0, get_env_float("SRT_MAX_CUE_SECONDS", 3.0))
+    max_cue_chars = max(0, get_env_int("SRT_MAX_CUE_CHARS", 0))
+    use_word_timestamps = max_cue_seconds > 0 or max_cue_chars > 0
 
     if model is None:
         try:
             from faster_whisper import WhisperModel
         except OSError as err:
-            print("Error loading faster-whisper runtime (Torch DLL initialization failed).")
+            print(
+                "Error loading faster-whisper runtime (Torch DLL initialization failed)."
+            )
             print("Likely Windows dependency issue in your venv.")
             print("Try reinstalling CPU wheels:")
             print("  python -m pip uninstall -y torch torchvision torchaudio")
-            print("  python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio")
+            print(
+                "  python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio"
+            )
             print(f"Details: {err}")
             return
         except Exception as err:
@@ -299,10 +740,19 @@ def stage_transcribe():
             model = WhisperModel("small", compute_type="int8")
         except Exception as err:
             msg = str(err)
-            if "LocalEntryNotFoundError" in msg or "cannot find the appropriate snapshot folder" in msg:
-                print("Error: Whisper model files are not available locally and auto-download failed.")
-                print("Check internet/proxy access to Hugging Face, then retry transcribe stage.")
-                print("Alternative: pre-download the model cache in an environment with internet.")
+            if (
+                "LocalEntryNotFoundError" in msg
+                or "cannot find the appropriate snapshot folder" in msg
+            ):
+                print(
+                    "Error: Whisper model files are not available locally and auto-download failed."
+                )
+                print(
+                    "Check internet/proxy access to Hugging Face, then retry transcribe stage."
+                )
+                print(
+                    "Alternative: pre-download the model cache in an environment with internet."
+                )
             else:
                 print(f"Error initializing Whisper model: {err}")
             return
@@ -323,8 +773,16 @@ def stage_transcribe():
 
         video = os.path.join(SRC, f)
         try:
-            segments, _ = model.transcribe(video, language="ja")
-            write_srt(list(segments), jp_path)
+            segments, _ = model.transcribe(
+                video, language="ja", word_timestamps=use_word_timestamps
+            )
+            segment_list = list(segments)
+            split_segments = split_segments_for_srt(
+                segment_list,
+                max_cue_seconds=max_cue_seconds,
+                max_cue_chars=max_cue_chars,
+            )
+            write_srt(split_segments, jp_path)
             log_file_status("transcribe", f, "Success")
         except Exception as err:
             log_file_status("transcribe", f, "Failed", str(err))
@@ -396,8 +854,7 @@ def stage_translate_en():
             if result.returncode == 0:
                 log_file_status("translate_en", f, "Success")
             else:
-                detail = (result.stderr or result.stdout).strip().splitlines()
-                detail = detail[-1] if detail else f"worker exit code {result.returncode}"
+                detail = summarize_worker_failure(result)
                 log_file_status("translate_en", f, "Failed", detail)
         except Exception as err:
             log_file_status("translate_en", f, "Failed", str(err))
@@ -432,8 +889,7 @@ def stage_translate_es():
             if result.returncode == 0:
                 log_file_status("translate_es", f, "Success")
             else:
-                detail = (result.stderr or result.stdout).strip().splitlines()
-                detail = detail[-1] if detail else f"worker exit code {result.returncode}"
+                detail = summarize_worker_failure(result)
                 log_file_status("translate_es", f, "Failed", detail)
         except Exception as err:
             log_file_status("translate_es", f, "Failed", str(err))
@@ -473,10 +929,11 @@ def stage_hardsub():
         srt1 = os.path.join(EN, f)
         srt2 = os.path.join(ES, f)
         try:
-            if hardsub(video, srt1, srt2, out):
+            ok, detail = hardsub(video, srt1, srt2, out)
+            if ok:
                 log_file_status("hardsub", f, "Success")
             else:
-                log_file_status("hardsub", f, "Failed", "ffmpeg returned non-zero")
+                log_file_status("hardsub", f, "Failed", detail)
         except Exception as err:
             log_file_status("hardsub", f, "Failed", str(err))
 
@@ -493,7 +950,9 @@ def main():
 
     if len(sys.argv) >= 2 and sys.argv[1] == "__translate_file":
         if len(sys.argv) != 5:
-            print("Usage: pipeline.py __translate_file [ja_en|en_es] <input_srt> <output_srt>")
+            print(
+                "Usage: pipeline.py __translate_file [ja_en|en_es] <input_srt> <output_srt>"
+            )
             sys.exit(2)
         try:
             code = worker_translate_file(sys.argv[2], sys.argv[3], sys.argv[4])
@@ -502,12 +961,23 @@ def main():
             print(f"Worker translation error: {err}")
             sys.exit(1)
 
-    possibleStages = {"all", "transcribe", "qc", "translate_en", "translate_es", "hardsub"}
-    usageHelp = "Usage: pipeline.py [all|transcribe|qc|translate_en|translate_es|hardsub]";
+    possibleStages = {
+        "all",
+        "transcribe",
+        "qc",
+        "translate_en",
+        "translate_es",
+        "hardsub",
+    }
+    usageHelp = (
+        "Usage: pipeline.py [all|transcribe|qc|translate_en|translate_es|hardsub]"
+    )
 
     if len(sys.argv) != 2:
         print(usageHelp)
-        print("Add files to /pipeline/0_src and run the script to begin a video pipeline")
+        print(
+            "Add files to /pipeline/0_src and run the script to begin a video pipeline"
+        )
         return
 
     stage = sys.argv[1]
@@ -516,7 +986,10 @@ def main():
         print(usageHelp)
         return
 
-    if stage in {"all", "translate_en", "translate_es"} and not validate_translate_python():
+    if (
+        stage in {"all", "translate_en", "translate_es"}
+        and not validate_translate_python()
+    ):
         return
 
     if stage == "transcribe":

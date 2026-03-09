@@ -20,8 +20,6 @@ def main() -> int:
 
     transcribe_python = (
         resolve_venv_python(repo_root, ".venv")
-        or resolve_venv_python(repo_root, "venv_transcribe")
-        or resolve_venv_python(repo_root, "venv")
         or sys.executable
     )
 

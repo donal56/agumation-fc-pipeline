@@ -12,14 +12,14 @@ def main() -> int:
     WhisperModel("small", compute_type="int8")
     print("Transcribe runtime OK")
 
-    # Deepl API validation
+    # OpenAI API validation
     import pipeline
 
     pipeline.load_local_env()
 
-    deepl_api_key = os.environ.get("DEEPL_API_KEY", "").strip()
-    if not deepl_api_key:
-        print("DEEPL_API_KEY is not set.")
+    openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not openai_api_key:
+        print("OPENAI_API_KEY is not set.")
         return 1
     
     print("Translation API OK")
