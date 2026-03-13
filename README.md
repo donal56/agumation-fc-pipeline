@@ -60,6 +60,10 @@ To generate shorter SRT cues during transcription:
     # Optional additional split by text length:
     # SRT_MAX_CUE_CHARS=0
 
+To remediate short cue issues (merge too-short cues), configure:
+
+    SRT_REMEDIATION_CONFIG=srt_remediation.json
+
 3.- Validate instalation:
 
     python init.py

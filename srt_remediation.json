@@ -1,0 +1,13 @@
+{
+  "short_cue_rules": [
+    { "chars_per_line": 1, "min_seconds": 0 },
+    { "chars_per_line": 2, "min_seconds": 0 },
+    { "chars_per_line": 3, "min_seconds": 0 },
+    { "chars_per_line": 4, "min_seconds": 0 },
+    { "chars_per_line": 5, "min_seconds": 0.5 },
+    { "chars_per_line": 6, "min_seconds": 0.6 },
+    { "chars_per_line": 7, "min_seconds": 0.7 },
+    { "chars_per_line": 8, "min_seconds": 0.8 },
+    { "chars_per_line": 9, "min_seconds": 0.9 }
+  ]
+}

@@ -38,6 +38,33 @@ def log_file_status(stage, filename, status, detail=""):
     print(f"[{stage}] {filename}: {status}{suffix}")
 
 
+def log_file_start(stage, filename):
+    # Print a progress line that will be overwritten by the final status.
+    print(f"[{stage}] {filename}: Processing...", end="\r", flush=True)
+
+
+def read_text_file(path):
+    with open(path, "r", encoding="utf8") as f:
+        return f.read()
+
+
+def is_blank_text_file(path):
+    if not os.path.exists(path):
+        return False
+    return read_text_file(path).strip() == ""
+
+
+def ensure_blank_file(path):
+    with open(path, "w", encoding="utf8") as f:
+        f.write("")
+
+
+def is_silent_source_case(name):
+    jp_path = os.path.join(JP, name + ".srt")
+    qc_path = os.path.join(QC, name + ".txt")
+    return is_blank_text_file(jp_path) and is_blank_text_file(qc_path)
+
+
 def load_local_env():
     global _local_env_loaded
     if _local_env_loaded:
@@ -111,6 +138,16 @@ def get_env_int(name, default):
         return default
 
 
+def load_json_config(path, default):
+    if not path or not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
 def _segment_value(segment, key, fallback=None):
     if isinstance(segment, dict):
         return segment.get(key, fallback)
@@ -118,6 +155,7 @@ def _segment_value(segment, key, fallback=None):
 
 
 SENTENCE_END_RE = re.compile(r"[.!?。！？][\"'”」』）\)\]]*$")
+CLAUSE_END_RE = re.compile(r"[,;、，；][\"'”」』）\)\]]*$")
 
 
 def _words_text(words):
@@ -129,7 +167,12 @@ def _build_word_chunk(words):
         return None
     start = _segment_value(words[0], "start", 0)
     end = _segment_value(words[-1], "end", start)
-    return {"start": start, "end": end, "text": _words_text(words)}
+    return {
+        "start": start,
+        "end": end,
+        "text": _words_text(words),
+        "words": words,
+    }
 
 
 def _exceeds_limits(words, max_cue_seconds, max_cue_chars):
@@ -154,9 +197,36 @@ def _find_sentence_break(words, max_tail_words=6):
     return None
 
 
+def _find_clause_break(words, max_tail_words=8):
+    if len(words) < 2:
+        return None
+    start_i = max(0, len(words) - 1 - max_tail_words)
+    for i in range(len(words) - 2, start_i - 1, -1):
+        token = _segment_value(words[i], "word", "").strip()
+        if token and CLAUSE_END_RE.search(token):
+            return i + 1
+    return None
+
+
+def _find_pause_break(words, min_gap_seconds, max_tail_words=8):
+    if len(words) < 2 or min_gap_seconds <= 0:
+        return None
+    start_i = max(0, len(words) - 1 - max_tail_words)
+    for i in range(len(words) - 2, start_i - 1, -1):
+        end_i = _segment_value(words[i], "end", None)
+        start_next = _segment_value(words[i + 1], "start", None)
+        if end_i is None or start_next is None:
+            continue
+        if (start_next - end_i) >= min_gap_seconds:
+            return i + 1
+    return None
+
+
 def split_segments_for_srt(segments, max_cue_seconds, max_cue_chars):
     if max_cue_seconds <= 0 and max_cue_chars <= 0:
         return segments
+
+    min_gap_seconds = max(0.0, get_env_float("SRT_SPLIT_GAP_SECONDS", 0.6))
 
     split = []
     for segment in segments:
@@ -202,6 +272,10 @@ def split_segments_for_srt(segments, max_cue_seconds, max_cue_chars):
 
             if exceeds_duration or exceeds_chars:
                 break_at = _find_sentence_break(candidate_words)
+                if break_at is None:
+                    break_at = _find_clause_break(candidate_words)
+                if break_at is None:
+                    break_at = _find_pause_break(candidate_words, min_gap_seconds)
                 if break_at is not None:
                     first_words = candidate_words[:break_at]
                     tail_words = candidate_words[break_at:]
@@ -227,6 +301,178 @@ def split_segments_for_srt(segments, max_cue_seconds, max_cue_chars):
         flush_chunk()
 
     return split
+
+
+def apply_short_cue_remediation(segments, rules):
+    if not rules:
+        return segments
+    prefix_rule = {
+        "prefix_punct_max_chars": 3,
+        "prefix_punct_max_seconds": 0.7,
+        "prefix_punct_delimiters": ".,?!。！？",
+    }
+    prefix_punct_set = set(prefix_rule["prefix_punct_delimiters"])
+
+    remediated = []
+    i = 0
+    while i < len(segments):
+        seg = segments[i]
+        text = str(_segment_value(seg, "text", "")).strip()
+        start = _segment_value(seg, "start", 0)
+        end = _segment_value(seg, "end", start)
+        duration = max(0.0, end - start)
+        length = len(text)
+
+        # If the line starts with a very short sentence that ends early, move it to the previous cue.
+        if remediated and text:
+            words = _segment_value(seg, "words", None)
+            if words:
+                prefix_words = []
+                prefix_text = ""
+                prefix_end = None
+                remainder_words = []
+                for word in words:
+                    w_text = str(_segment_value(word, "word", ""))
+                    prefix_words.append(word)
+                    prefix_text = (prefix_text + w_text).strip()
+                    for ch in w_text:
+                        if ch in prefix_punct_set:
+                            prefix_end = _segment_value(word, "end", None)
+                            remainder_words = words[len(prefix_words) :]
+                            break
+                    if prefix_end is not None:
+                        break
+                if prefix_end is not None:
+                    prefix_len = len(prefix_text.replace(" ", ""))
+                    prefix_start = _segment_value(prefix_words[0], "start", start)
+                    prefix_duration = max(0.0, prefix_end - prefix_start)
+                    if (
+                        0 < prefix_len <= prefix_rule["prefix_punct_max_chars"]
+                        and prefix_duration <= prefix_rule["prefix_punct_max_seconds"]
+                    ):
+                        prev = remediated.pop()
+                        merged_prev = {
+                            "start": _segment_value(prev, "start", start),
+                            "end": _segment_value(prev, "end", start),
+                            "text": (
+                                str(_segment_value(prev, "text", "")).strip()
+                                + " "
+                                + prefix_text
+                            ).strip(),
+                            "words": (_segment_value(prev, "words", None) or []) + prefix_words,
+                        }
+                        remediated.append(merged_prev)
+                        if remainder_words:
+                            seg = {
+                                "start": _segment_value(remainder_words[0], "start", start),
+                                "end": _segment_value(remainder_words[-1], "end", end),
+                                "text": _words_text(remainder_words),
+                                "words": remainder_words,
+                            }
+                            text = str(_segment_value(seg, "text", "")).strip()
+                            start = _segment_value(seg, "start", start)
+                            end = _segment_value(seg, "end", end)
+                            length = len(text)
+                        else:
+                            i += 1
+                            continue
+            else:
+                split_at = None
+                for idx, ch in enumerate(text):
+                    if ch in prefix_punct_set:
+                        split_at = idx
+                        break
+                if split_at is not None:
+                    prefix = text[: split_at + 1]
+                    prefix_len = len(prefix.replace(" ", ""))
+                    if 0 < prefix_len <= prefix_rule["prefix_punct_max_chars"]:
+                        prev = remediated.pop()
+                        merged_prev = {
+                            "start": _segment_value(prev, "start", start),
+                            "end": _segment_value(prev, "end", start),
+                            "text": (
+                                str(_segment_value(prev, "text", "")).strip()
+                                + " "
+                                + prefix
+                            ).strip(),
+                        }
+                        remediated.append(merged_prev)
+                        text = text[split_at + 1 :].lstrip()
+                        length = len(text)
+                        if not text:
+                            i += 1
+                            continue
+
+        should_merge = False
+        merge_into_previous = False
+        for rule in rules:
+            try:
+                charsPerLine = int(rule.get("chars_per_line", -1))
+                minSeconds = float(rule.get("min_seconds", -1))
+            except Exception:
+                continue
+            if charsPerLine >= 0 and minSeconds >= 0:
+                duration_block = True if minSeconds == 0 else duration <= minSeconds
+                if length <= charsPerLine and duration_block:
+                    should_merge = True
+                    break
+
+        punct_chars = prefix_rule["prefix_punct_delimiters"]
+        max_prefix_chars = int(prefix_rule["prefix_punct_max_chars"])
+        max_prefix_seconds = float(prefix_rule["prefix_punct_max_seconds"])
+        if max_prefix_chars > 0 and max_prefix_seconds >= 0:
+            duration_ok = True if max_prefix_seconds == 0 else duration <= max_prefix_seconds
+            if length <= max_prefix_chars and duration_ok:
+                if length > 0 and text and text[-1] in punct_chars:
+                    should_merge = True
+                    merge_into_previous = True
+
+        if not should_merge:
+            remediated.append(seg)
+            i += 1
+            continue
+
+        if merge_into_previous and remediated:
+            prev = remediated.pop()
+            merged = {
+                "start": _segment_value(prev, "start", start),
+                "end": end,
+                "text": (str(_segment_value(prev, "text", "")).strip() + " " + text).strip(),
+            }
+            remediated.append(merged)
+            i += 1
+            continue
+
+        # Prefer merging with the next segment.
+        if i + 1 < len(segments):
+            nxt = segments[i + 1]
+            merged = {
+                "start": start,
+                "end": _segment_value(nxt, "end", end),
+                "text": (text + " " + str(_segment_value(nxt, "text", "")).strip()).strip(),
+                "words": (_segment_value(seg, "words", None) or [])
+                + (_segment_value(nxt, "words", None) or []),
+            }
+            remediated.append(merged)
+            i += 2
+            continue
+
+        # Fallback: merge into previous if this is the last segment.
+        if remediated:
+            prev = remediated.pop()
+            merged = {
+                "start": _segment_value(prev, "start", start),
+                "end": end,
+                "text": (str(_segment_value(prev, "text", "")).strip() + " " + text).strip(),
+                "words": (_segment_value(prev, "words", None) or [])
+                + (_segment_value(seg, "words", None) or []),
+            }
+            remediated.append(merged)
+        else:
+            remediated.append(seg)
+        i += 1
+
+    return remediated
 
 
 def write_srt(segments, path):
@@ -602,14 +848,24 @@ def qc_check_srt(path):
     with open(path, "r", encoding="utf8") as f:
         lines = f.readlines()
 
+    if "".join(lines).strip() == "":
+        return ["Transcripcion vacia (sin cues en SRT)"]
+
     i = 0
+    found_cue = False
+    cue_counter = 0
 
     while i < len(lines):
 
         if "-->" in lines[i]:
+            found_cue = True
+            cue_counter += 1
 
             time_line = lines[i].strip()
             text_line = lines[i + 1].strip()
+            cue_label = str(cue_counter)
+            if i > 0 and lines[i - 1].strip().isdigit():
+                cue_label = lines[i - 1].strip()
 
             start, end = time_line.split("-->")
 
@@ -625,18 +881,21 @@ def qc_check_srt(path):
             cps = chars / dur if dur > 0 else 999
 
             if chars > 42:
-                problems.append(f"Linea larga ({chars} chars): {text_line}")
+                problems.append(f"Cue {cue_label}: Linea larga ({chars} chars): {text_line}")
 
             if dur < 0.7:
-                problems.append(f"Duracion muy corta {dur:.2f}s: {text_line}")
+                problems.append(f"Cue {cue_label}: Duracion muy corta {dur:.2f}s: {text_line}")
 
             if dur > 7:
-                problems.append(f"Duracion muy larga {dur:.2f}s: {text_line}")
+                problems.append(f"Cue {cue_label}: Duracion muy larga {dur:.2f}s: {text_line}")
 
             if cps > 20:
-                problems.append(f"Lectura rapida {cps:.1f} cps: {text_line}")
+                problems.append(f"Cue {cue_label}: Lectura rapida {cps:.1f} cps: {text_line}")
 
         i += 1
+
+    if not found_cue:
+        problems.append("SRT sin cues validos (no se encontraron timestamps)")
 
     return problems
 
@@ -713,9 +972,14 @@ def stage_transcribe():
     print("\nSTAGE: TRANSCRIBE\n")
     global model
     load_local_env()
-    max_cue_seconds = max(0.0, get_env_float("SRT_MAX_CUE_SECONDS", 3.0))
-    max_cue_chars = max(0, get_env_int("SRT_MAX_CUE_CHARS", 0))
+    max_cue_seconds = max(0.0, get_env_float("SRT_MAX_CUE_SECONDS", 8.0))
+    max_cue_chars = max(0, get_env_int("SRT_MAX_CUE_CHARS", 15))
     use_word_timestamps = max_cue_seconds > 0 or max_cue_chars > 0
+    remediation_config_path = os.environ.get(
+        "SRT_REMEDIATION_CONFIG", "srt_remediation.json"
+    ).strip()
+    remediation_config = load_json_config(remediation_config_path, {})
+    short_cue_rules = remediation_config.get("short_cue_rules", [])
 
     if model is None:
         try:
@@ -762,6 +1026,7 @@ def stage_transcribe():
         if not f.lower().endswith(VIDEO_EXT):
             log_file_status("transcribe", f, "Skipped", "unsupported extension")
             continue
+        log_file_start("transcribe", f)
 
         name = os.path.splitext(f)[0]
 
@@ -782,7 +1047,10 @@ def stage_transcribe():
                 max_cue_seconds=max_cue_seconds,
                 max_cue_chars=max_cue_chars,
             )
-            write_srt(split_segments, jp_path)
+            remediated_segments = apply_short_cue_remediation(
+                split_segments, short_cue_rules
+            )
+            write_srt(remediated_segments, jp_path)
             log_file_status("transcribe", f, "Success")
         except Exception as err:
             log_file_status("transcribe", f, "Failed", str(err))
@@ -796,6 +1064,7 @@ def stage_qc():
         if not f.lower().endswith(".srt"):
             log_file_status("qc", f, "Skipped", "unsupported extension")
             continue
+        log_file_start("qc", f)
 
         name = os.path.splitext(f)[0]
 
@@ -828,6 +1097,7 @@ def stage_translate_en():
         if not f.lower().endswith(".srt"):
             log_file_status("translate_en", f, "Skipped", "unsupported extension")
             continue
+        log_file_start("translate_en", f)
 
         name = os.path.splitext(f)[0]
 
@@ -847,6 +1117,15 @@ def stage_translate_en():
             qc_contents = qc_file.read().strip()
         if qc_contents:
             log_file_status("translate_en", f, "Skipped", "QC has issues")
+            continue
+
+        if is_silent_source_case(name):
+            log_file_status(
+                "translate_en",
+                f,
+                "Success",
+                "silent source, translation skipped (no SRT generated)",
+            )
             continue
 
         try:
@@ -870,18 +1149,32 @@ def stage_translate_es():
         if en_es is None:
             return
 
-    for f in os.listdir(EN):
+    for f in os.listdir(JP):
         if not f.lower().endswith(".srt"):
             log_file_status("translate_es", f, "Skipped", "unsupported extension")
             continue
+        log_file_start("translate_es", f)
 
         name = os.path.splitext(f)[0]
 
-        en = os.path.join(EN, f)
+        en = os.path.join(EN, name + ".srt")
         es_out = os.path.join(ES, name + ".srt")
 
         if os.path.exists(es_out):
             log_file_status("translate_es", f, "Skipped", "already translated")
+            continue
+
+        if is_silent_source_case(name):
+            log_file_status(
+                "translate_es",
+                f,
+                "Success",
+                "silent source, translation skipped (no SRT generated)",
+            )
+            continue
+
+        if not os.path.exists(en):
+            log_file_status("translate_es", f, "Skipped", "missing EN subtitle")
             continue
 
         try:
@@ -899,10 +1192,11 @@ def stage_hardsub():
 
     print("\nSTAGE: HARDSUB\n")
 
-    for f in os.listdir(ES):
-        if not f.lower().endswith(".srt"):
+    for f in os.listdir(SRC):
+        if not f.lower().endswith(VIDEO_EXT):
             log_file_status("hardsub", f, "Skipped", "unsupported extension")
             continue
+        log_file_start("hardsub", f)
 
         name = os.path.splitext(f)[0]
 
@@ -926,8 +1220,25 @@ def stage_hardsub():
             log_file_status("hardsub", f, "Skipped", "already generated")
             continue
 
-        srt1 = os.path.join(EN, f)
-        srt2 = os.path.join(ES, f)
+        if is_silent_source_case(name):
+            try:
+                shutil.copyfile(video, out)
+                log_file_status(
+                    "hardsub",
+                    f,
+                    "Success",
+                    "silent source, copied without subtitles",
+                )
+            except Exception as err:
+                log_file_status("hardsub", f, "Failed", str(err))
+            continue
+
+        srt_filename = name + ".srt"
+        srt1 = os.path.join(EN, srt_filename)
+        srt2 = os.path.join(ES, srt_filename)
+        if not os.path.exists(srt1) or not os.path.exists(srt2):
+            log_file_status("hardsub", f, "Skipped", "missing translated subtitles")
+            continue
         try:
             ok, detail = hardsub(video, srt1, srt2, out)
             if ok:
