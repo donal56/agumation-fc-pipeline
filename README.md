@@ -54,16 +54,6 @@ For custom context, add:
     # OPENAI_CONTEXT_JA_EN=Use formal style
     # OPENAI_CONTEXT_EN_ES=Use mexican slang
 
-To generate shorter SRT cues during transcription:
-
-    SRT_MAX_CUE_SECONDS=3.0
-    # Optional additional split by text length:
-    # SRT_MAX_CUE_CHARS=0
-
-To remediate short cue issues (merge too-short cues), configure:
-
-    SRT_REMEDIATION_CONFIG=srt_remediation.json
-
 3.- Validate instalation:
 
     python init.py

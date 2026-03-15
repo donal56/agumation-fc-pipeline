@@ -1,0 +1,2 @@
+- Skip folders
+- Command ends in 'es' but the folder ends in 'sp'
