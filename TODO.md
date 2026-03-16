@@ -1,2 +1,3 @@
 - Skip folders
 - Command ends in 'es' but the folder ends in 'sp'
+- Add helper command to clear a file from the pipeline

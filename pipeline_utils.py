@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import warnings
@@ -496,26 +498,50 @@ def is_silent_source_case(name: str) -> bool:
 
 
 def _ffmpeg_escape(path: str) -> str:
-    return Path(path).resolve().as_posix().replace(":", "\\:")
+    # Escape path for ffmpeg filtergraph parsing (not shell escaping).
+    # See: subtitles filter expects ':' and '\'' escaped inside filename.
+    escaped = Path(path).resolve().as_posix()
+    escaped = escaped.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+    return f"'{escaped}'"
+
+
+def _safe_srt_path(src: str) -> str:
+    runtime_dir = ROOT / ".runtime" / "hardsub"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1(src.encode("utf8")).hexdigest()[:12]
+    safe_name = f"srt_{digest}.srt"
+    dst = runtime_dir / safe_name
+    shutil.copyfile(src, dst)
+    return str(dst)
 
 
 def hardsub(video_path: str, en_srt: str, es_srt: str, out_path: str) -> tuple[bool, str]:
-    en_filter = f"subtitles='{_ffmpeg_escape(en_srt)}':force_style='Alignment=2'"
-    es_filter = f"subtitles='{_ffmpeg_escape(es_srt)}':force_style='Alignment=8'"
-    vf = f"{es_filter},{en_filter}"
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        video_path,
-        "-vf",
-        vf,
-        "-c:a",
-        "copy",
-        out_path,
-    ]
-    result = subprocess.run(cmd, text=True, capture_output=True, check=False)
-    if result.returncode == 0:
-        return True, ""
-    detail = (result.stderr or result.stdout or "").strip()
-    return False, detail.splitlines()[-1] if detail else "ffmpeg failed"
+    en_safe = _safe_srt_path(en_srt)
+    es_safe = _safe_srt_path(es_srt)
+    try:
+        font_base_style = "Fontname=Calibri,PrimaryColour=&HFFFFFF&,Fontsize=21"
+        en_filter = f"[0]subtitles=filename={_ffmpeg_escape(en_safe)}:force_style='{font_base_style},Alignment=6'[a]"
+        es_filter = f"[a]subtitles=filename={_ffmpeg_escape(es_safe)}:force_style='{font_base_style}'"
+        vf = f"{es_filter}; {en_filter}"
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_path,
+            "-filter_complex",
+            vf,
+            "-c:a",
+            "copy",
+            out_path,
+        ]
+        result = subprocess.run(cmd, text=True, capture_output=True, check=False)
+        if result.returncode == 0:
+            return True, ""
+        detail = (result.stderr or result.stdout or "").strip()
+        return False, detail.splitlines()[-1] if detail else "ffmpeg failed"
+    finally:
+        for temp_path in (en_safe, es_safe):
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except Exception:
+                pass

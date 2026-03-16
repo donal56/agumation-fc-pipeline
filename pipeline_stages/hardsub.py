@@ -36,17 +36,15 @@ def stage_hardsub():
             pu.log_file_status("hardsub", f, "Skipped", "Already generated")
             continue
 
-        if pu.is_silent_source_case(name):
+        def copy_video(reason: str) -> None:
             try:
                 shutil.copyfile(video, out)
-                pu.log_file_status(
-                    "hardsub",
-                    f,
-                    "Success",
-                    "Silent source, copied without subtitles",
-                )
+                pu.log_file_status("hardsub", f, "Success", reason)
             except Exception as err:
                 pu.log_file_status("hardsub", f, "Failed", str(err))
+
+        if pu.is_silent_source_case(name):
+            copy_video("Silent source, copied without subtitles")
             continue
 
         srt_filename = name + ".srt"
@@ -54,6 +52,9 @@ def stage_hardsub():
         srt2 = os.path.join(pu.ES, srt_filename)
         if not os.path.exists(srt1) or not os.path.exists(srt2):
             pu.log_file_status("hardsub", f, "Skipped", "Missing translated subtitles")
+            continue
+        if not pu.read_srt(srt1) and not pu.read_srt(srt2):
+            copy_video("Both translated subtitles empty, copied without subtitles")
             continue
         try:
             ok, detail = pu.hardsub(video, srt1, srt2, out)
