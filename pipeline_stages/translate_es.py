@@ -9,44 +9,41 @@ def stage_translate_es():
 
     translate_python = os.environ.get("TRANSLATE_PYTHON", "").strip()
     if not translate_python:
-        _, en_es = pu.get_translators()
-        if en_es is None:
+        sucess = pu.init_translation_process()
+        if not sucess:
             return
 
-    for f in os.listdir(pu.JP):
-        if not f.lower().endswith(".srt"):
-            pu.log_file_status("translate_es", f, "Skipped", "unsupported extension")
+    for f in os.scandir(pu.JP):
+        if not f.is_file():
+            break
+
+        if not f.name.lower().endswith(".srt"):
+            pu.log_file_status("translate_es", f.name, "Skipped", "unsupported extension")
             continue
-        pu.log_file_start("translate_es", f)
+        pu.log_file_start("translate_es", f.name)
 
-        name = os.path.splitext(f)[0]
+        raw_name = os.path.splitext(f.name)[0]
 
-        en = os.path.join(pu.EN, name + ".srt")
-        es_out = os.path.join(pu.ES, name + ".srt")
+        en = os.path.join(pu.EN, raw_name + ".srt")
+        es_out = os.path.join(pu.ES, raw_name + ".srt")
 
         if os.path.exists(es_out):
-            pu.log_file_status("translate_es", f, "Skipped", "Already translated")
-            continue
-
-        if pu.is_silent_source_case(name):
-            pu.log_file_status(
-                "translate_es",
-                f,
-                "Success",
-                "Silent source, translation skipped (No SRT generated)",
-            )
+            pu.log_file_status("translate_es", f.name, "Skipped", "Already translated")
             continue
 
         if not os.path.exists(en):
-            pu.log_file_status("translate_es", f, "Skipped", "Missing EN subtitle")
+            pu.log_file_status("translate_es", f.name, "Skipped", "Missing EN subtitle")
             continue
 
         try:
             result = pu.run_translate_file_worker("en_es", en, es_out)
             if result.returncode == 0:
-                pu.log_file_status("translate_es", f, "Success")
+                pu.log_file_status("translate_es", f.name, "Success")
+            elif result.returncode == 2:
+                detail = pu.summarize_worker_failure(result)
+                pu.log_file_status("translate_es", f.name, "Skipped", detail)
             else:
                 detail = pu.summarize_worker_failure(result)
-                pu.log_file_status("translate_es", f, "Failed", detail)
+                pu.log_file_status("translate_es", f.name, "Failed", detail)
         except Exception as err:
-            pu.log_file_status("translate_es", f, "Failed", str(err))
+            pu.log_file_status("translate_es", f.name, "Failed", str(err))

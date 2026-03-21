@@ -9,51 +9,48 @@ def stage_translate_en():
 
     translate_python = os.environ.get("TRANSLATE_PYTHON", "").strip()
     if not translate_python:
-        ja_en, _ = pu.get_translators()
-        if ja_en is None:
+        sucess = pu.init_translation_process()
+        if not sucess:
             return
 
-    for f in os.listdir(pu.JP):
-        if not f.lower().endswith(".srt"):
-            pu.log_file_status("translate_en", f, "Skipped", "Unsupported extension")
+    for f in os.scandir(pu.JP):
+        if not f.is_file():
+            break
+
+        if not f.name.lower().endswith(".srt"):
+            pu.log_file_status("translate_en", f.name, "Skipped", "Unsupported extension")
             continue
-        pu.log_file_start("translate_en", f)
+        pu.log_file_start("translate_en", f.name)
 
-        name = os.path.splitext(f)[0]
+        raw_name = os.path.splitext(f.name)[0]
 
-        jp = os.path.join(pu.JP, f)
-        en_out = os.path.join(pu.EN, name + ".srt")
-        qc_path = os.path.join(pu.QC, name + ".txt")
+        jp = os.path.join(pu.JP, f.name)
+        en_out = os.path.join(pu.EN, raw_name + ".srt")
+        qc_path = os.path.join(pu.QC, raw_name + ".txt")
 
         if os.path.exists(en_out):
-            pu.log_file_status("translate_en", f, "Skipped", "Already translated")
+            pu.log_file_status("translate_en", f.name, "Skipped", "Already translated")
             continue
 
         if not os.path.exists(qc_path):
-            pu.log_file_status("translate_en", f, "Skipped", "Missing QC file")
+            pu.log_file_status("translate_en", f.name, "Skipped", "Missing QC file")
             continue
 
         with open(qc_path, "r", encoding="utf8") as qc_file:
             qc_contents = qc_file.read().strip()
         if qc_contents:
-            pu.log_file_status("translate_en", f, "Skipped", "QC has issues")
-            continue
-
-        if pu.is_silent_source_case(name):
-            pu.log_file_status(
-                "translate_en",
-                f,
-                "Success",
-                "Silent source, translation skipped (No SRT generated)",
-            )
+            pu.log_file_status("translate_en", f.name, "Skipped", "QC has issues")
             continue
 
         try:
             result = pu.run_translate_file_worker("ja_en", jp, en_out)
             if result.returncode == 0:
-                pu.log_file_status("translate_en", f, "Success")
+                pu.log_file_status("translate_en", f.name, "Success")
+            elif result.returncode == 2:
+                detail = pu.summarize_worker_failure(result)
+                pu.log_file_status("translate_en", f.name, "Skipped", detail)
             else:
                 detail = pu.summarize_worker_failure(result)
-                pu.log_file_status("translate_en", f, "Failed", detail)
+                pu.log_file_status("translate_en", f.name, "Failed", detail)
         except Exception as err:
-            pu.log_file_status("translate_en", f, "Failed", str(err))
+            pu.log_file_status("translate_en", f.name, "Failed", str(err))

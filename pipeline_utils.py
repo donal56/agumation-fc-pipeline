@@ -293,12 +293,40 @@ def qc_check_srt(path: str) -> list[str]:
     if not cues:
         problems.append("Empty SRT file")
         return problems
+
+    def has_internal_sentence_punct(text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        last_idx = len(stripped) - 1
+
+        ignored_dot_idxs: set[int] = set()
+        i = 0
+        while i < len(stripped):
+            if stripped[i] == ".":
+                run_start = i
+                while i < len(stripped) and stripped[i] == ".":
+                    i += 1
+                if i - run_start >= 3:
+                    ignored_dot_idxs.update(range(run_start, i))
+                continue
+            i += 1
+
+        for idx, ch in enumerate(stripped):
+            if ch == "." and idx not in ignored_dot_idxs and idx != last_idx:
+                return True
+            if ch == "。" and idx != last_idx:
+                return True
+        return False
+
     prev_end = 0.0
     for cue in cues:
         if cue.start >= cue.end:
             problems.append(f"Cue {cue.index}: start time >= end time")
         if cue.text.strip() == "":
             problems.append(f"Cue {cue.index}: empty text")
+        if has_internal_sentence_punct(cue.text):
+            problems.append(f"Cue {cue.index}: sentence punctuation not at end")
         if cue.start < prev_end:
             problems.append(f"Cue {cue.index}: overlaps previous cue")
         prev_end = max(prev_end, cue.end)
@@ -431,8 +459,8 @@ def worker_translate_file(pair: str, input_srt: str, output_srt: str) -> int:
     source_lang, target_lang = pair.split("_", 1)
     cues = read_srt(input_srt)
     if not cues:
-        print("No cues to translate.")
-        return 1
+        print("No transcription present")
+        return 2
     try:
         texts = [cue.text for cue in cues]
         translated = _translate_texts(source_lang, target_lang, texts)
@@ -448,7 +476,7 @@ def worker_translate_file(pair: str, input_srt: str, output_srt: str) -> int:
     return 0
 
 
-def validate_translate_python() -> bool:
+def init_translation_process() -> bool:
     load_local_env()
     translate_python = os.environ.get("TRANSLATE_PYTHON", "").strip()
     if translate_python and not Path(translate_python).exists():
@@ -459,13 +487,6 @@ def validate_translate_python() -> bool:
         print("OPENAI_API_KEY is not set. Configure it in .env.local.")
         return False
     return True
-
-
-def get_translators() -> tuple[object | None, object | None]:
-    if not validate_translate_python():
-        return None, None
-    return object(), object()
-
 
 def run_translate_file_worker(pair: str, input_srt: str, output_srt: str) -> subprocess.CompletedProcess[str]:
     translate_python = os.environ.get("TRANSLATE_PYTHON", "").strip() or sys.executable
@@ -488,13 +509,6 @@ def summarize_worker_failure(result: subprocess.CompletedProcess[str]) -> str:
         return f"Worker failed with exit code {result.returncode}"
     lines = [line for line in detail.splitlines() if line.strip()]
     return lines[-1] if lines else f"Worker failed with exit code {result.returncode}"
-
-
-def is_silent_source_case(name: str) -> bool:
-    tags_raw = os.environ.get("SILENT_SOURCE_TAGS", "_silent,-silent,.silent")
-    tags = [t.strip().lower() for t in tags_raw.split(",") if t.strip()]
-    lower = name.lower()
-    return any(tag in lower for tag in tags)
 
 
 def _ffmpeg_escape(path: str) -> str:

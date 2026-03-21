@@ -7,24 +7,27 @@ def stage_qc():
 
     print("\nSTAGE: QC\n")
 
-    for f in os.listdir(pu.JP):
-        if not f.lower().endswith(".srt"):
-            pu.log_file_status("qc", f, "Skipped", "Unsupported extension")
+    for f in os.scandir(pu.JP):
+        if not f.is_file():
+            break
+        
+        if not f.name.lower().endswith(".srt"):
+            pu.log_file_status("qc", f.name, "Skipped", "Unsupported extension")
             continue
-        pu.log_file_start("qc", f)
+        pu.log_file_start("qc", f.name)
 
-        name = os.path.splitext(f)[0]
+        raw_name = os.path.splitext(f.name)[0]
 
-        path = os.path.join(pu.JP, f)
-        out = os.path.join(pu.QC, name + ".txt")
+        path = os.path.join(pu.JP, f.name)
+        out = os.path.join(pu.QC, raw_name + ".txt")
         try:
             problems = pu.qc_check_srt(path)
             with open(out, "w", encoding="utf8") as qc_file:
                 for p in problems:
                     qc_file.write(p + "\n")
             if problems:
-                pu.log_file_status("qc", f, "Failed", f"Found {len(problems)} issues")
+                pu.log_file_status("qc", f.name, "Failed", f"Found {len(problems)} issues")
             else:
-                pu.log_file_status("qc", f, "Success")
+                pu.log_file_status("qc", f.name, "Success")
         except Exception as err:
-            pu.log_file_status("qc", f, "Failed", str(err))
+            pu.log_file_status("qc", f.name, "Failed", str(err))

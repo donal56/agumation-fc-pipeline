@@ -52,7 +52,7 @@ def main():
 
     if (
         stage in {"all", "translate_en", "translate_es"}
-        and not pu.validate_translate_python()
+        and not pu.init_translation_process()
     ):
         return
 

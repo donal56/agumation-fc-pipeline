@@ -10,9 +10,13 @@ LONG_SILENCE_SECONDS = 1.0
 
 
 def _word_text(word: object) -> str:
+    final_word = ""
     if isinstance(word, dict):
-        return str(word.get("word", ""))
-    return str(getattr(word, "word", ""))
+        final_word = str(word.get("word", ""))
+    else:
+        final_word = str(getattr(word, "word", ""))
+    # This is useful only for JP source transcriptions
+    return final_word.replace(" ", "。")
 
 
 def _word_start(word: object, default: float) -> float:

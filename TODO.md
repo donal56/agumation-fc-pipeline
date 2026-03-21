@@ -1,3 +1,6 @@
 - Skip folders
 - Command ends in 'es' but the folder ends in 'sp'
 - Add helper command to clear a file from the pipeline
+- Min cue size
+- Split cue if it contains an ellipsis #71
+- Or a question mark #86

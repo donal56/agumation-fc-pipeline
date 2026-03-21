@@ -8,50 +8,53 @@ def stage_hardsub():
 
     print("\nSTAGE: HARDSUB\n")
 
-    for f in os.listdir(pu.SRC):
-        if not f.lower().endswith(pu.VIDEO_EXT):
-            pu.log_file_status("hardsub", f, "Skipped", "Unsupported extension")
-            continue
-        pu.log_file_start("hardsub", f)
+    for f in os.scandir(pu.JP):
+        if not f.is_file():
+            break
 
-        name = os.path.splitext(f)[0]
+        if not f.name.lower().endswith(pu.VIDEO_EXT):
+            pu.log_file_status("hardsub", f.name, "Skipped", "Unsupported extension")
+            continue
+        pu.log_file_start("hardsub", f.name)
+
+        raw_name = os.path.splitext(f.name)[0]
 
         video = None
 
         for ext in pu.VIDEO_EXT:
 
-            candidate = os.path.join(pu.SRC, name + ext)
+            candidate = os.path.join(pu.SRC, raw_name + ext)
 
             if os.path.exists(candidate):
                 video = candidate
                 break
 
         if video is None:
-            pu.log_file_status("hardsub", f, "Skipped", "Source video not found")
+            pu.log_file_status("hardsub", f.name, "Skipped", "Source video not found")
             continue
 
-        out = os.path.join(pu.OUT, name + "_sub.mp4")
+        out = os.path.join(pu.OUT, raw_name + "_sub.mp4")
 
         if os.path.exists(out):
-            pu.log_file_status("hardsub", f, "Skipped", "Already generated")
+            pu.log_file_status("hardsub", f.name, "Skipped", "Already generated")
             continue
 
         def copy_video(reason: str) -> None:
             try:
                 shutil.copyfile(video, out)
-                pu.log_file_status("hardsub", f, "Success", reason)
+                pu.log_file_status("hardsub", f.name, "Success", reason)
             except Exception as err:
-                pu.log_file_status("hardsub", f, "Failed", str(err))
+                pu.log_file_status("hardsub", f.name, "Failed", str(err))
 
-        if pu.is_silent_source_case(name):
+        if pu.is_silent_source_case(raw_name):
             copy_video("Silent source, copied without subtitles")
             continue
 
-        srt_filename = name + ".srt"
+        srt_filename = raw_name + ".srt"
         srt1 = os.path.join(pu.EN, srt_filename)
         srt2 = os.path.join(pu.ES, srt_filename)
         if not os.path.exists(srt1) or not os.path.exists(srt2):
-            pu.log_file_status("hardsub", f, "Skipped", "Missing translated subtitles")
+            pu.log_file_status("hardsub", f.name, "Skipped", "Missing translated subtitles")
             continue
         if not pu.read_srt(srt1) and not pu.read_srt(srt2):
             copy_video("Both translated subtitles empty, copied without subtitles")
@@ -59,8 +62,8 @@ def stage_hardsub():
         try:
             ok, detail = pu.hardsub(video, srt1, srt2, out)
             if ok:
-                pu.log_file_status("hardsub", f, "Success")
+                pu.log_file_status("hardsub", f.name, "Success")
             else:
-                pu.log_file_status("hardsub", f, "Failed", detail)
+                pu.log_file_status("hardsub", f.name, "Failed", detail)
         except Exception as err:
-            pu.log_file_status("hardsub", f, "Failed", str(err))
+            pu.log_file_status("hardsub", f.name, "Failed", str(err))
