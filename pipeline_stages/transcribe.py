@@ -7,6 +7,9 @@ SENTENCE_PUNCT = {".", "。", ";", "；", ":", "：", "?", "？", "¿", "!", "�
 SOFT_PUNCT = {",", "，", "、"}
 LONG_WORD_SECONDS = 2.0
 LONG_SILENCE_SECONDS = 1.0
+SHORT_CUE_SECONDS = 0.6
+SHORT_CUE_CHARS = 3
+SHORT_CUE_MERGE_OVERFLOW_SECONDS = 0.75
 
 
 def _word_text(word: object) -> str:
@@ -31,6 +34,47 @@ def _word_end(word: object, default: float) -> float:
     return float(getattr(word, "end", default))
 
 
+def _split_text_on_sentence_punct(text: str) -> list[str]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+
+    parts: list[str] = []
+    current = ""
+    for ch in stripped:
+        current += ch
+        if ch in SENTENCE_PUNCT:
+            parts.append(current)
+            current = ""
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _build_timed_text_parts(text: str, start: float, end: float) -> list[dict]:
+    parts = _split_text_on_sentence_punct(text)
+    if not parts:
+        return []
+    if len(parts) == 1:
+        return [{"text": parts[0], "start": start, "end": end}]
+
+    duration = max(0.0, end - start)
+    total_units = sum(max(1, len(part)) for part in parts)
+    elapsed_units = 0
+    output: list[dict] = []
+
+    for idx, part in enumerate(parts):
+        part_start = start if idx == 0 else output[-1]["end"]
+        elapsed_units += max(1, len(part))
+        if idx == len(parts) - 1:
+            part_end = end
+        else:
+            part_end = start + (duration * elapsed_units / total_units)
+        output.append({"text": part, "start": float(part_start), "end": float(part_end)})
+
+    return output
+
+
 def _segment_words(segment: object) -> list[dict]:
     words = getattr(segment, "words", None)
     if words is None and isinstance(segment, dict):
@@ -38,12 +82,12 @@ def _segment_words(segment: object) -> list[dict]:
     if words:
         output = []
         for word in words:
-            output.append(
-                {
-                    "text": _word_text(word),
-                    "start": _word_start(word, 0.0),
-                    "end": _word_end(word, 0.0),
-                }
+            output.extend(
+                _build_timed_text_parts(
+                    _word_text(word),
+                    _word_start(word, 0.0),
+                    _word_end(word, 0.0),
+                )
             )
         return output
 
@@ -56,7 +100,7 @@ def _segment_words(segment: object) -> list[dict]:
         start = segment.get("start", start)
         end = segment.get("end", end)
     if text:
-        return [{"text": str(text), "start": float(start), "end": float(end)}]
+        return _build_timed_text_parts(str(text), float(start), float(end))
     return []
 
 
@@ -69,6 +113,38 @@ def _sentence_duration(words: list[dict]) -> float:
     if not words:
         return 0.0
     return float(words[-1]["end"]) - float(words[0]["start"])
+
+
+def _chunk_duration(words: list[dict]) -> float:
+    if not words:
+        return 0.0
+    return float(words[-1]["end"]) - float(words[0]["start"])
+
+
+def _chunk_text(words: list[dict]) -> str:
+    return "".join(w["text"] for w in words).strip()
+
+
+def _is_short_chunk(words: list[dict]) -> bool:
+    text = _chunk_text(words)
+    return _chunk_duration(words) < SHORT_CUE_SECONDS or len(text) <= SHORT_CUE_CHARS
+
+
+def _merge_short_trailing_chunk(
+    chunks: list[list[dict]], max_cue_seconds: float
+) -> list[list[dict]]:
+    if len(chunks) < 2 or max_cue_seconds <= 0:
+        return chunks
+
+    trailing = chunks[-1]
+    if not _is_short_chunk(trailing):
+        return chunks
+
+    merged_duration = float(trailing[-1]["end"]) - float(chunks[-2][0]["start"])
+    if merged_duration > max_cue_seconds + SHORT_CUE_MERGE_OVERFLOW_SECONDS:
+        return chunks
+
+    return chunks[:-2] + [chunks[-2] + trailing]
 
 
 def _split_sentence_on_soft_pauses(
@@ -113,7 +189,7 @@ def _split_sentence_on_soft_pauses(
             else:
                 output.append(items[start_idx:end_idx])
                 start_idx = end_idx
-        return output
+        return _merge_short_trailing_chunk(output, max_cue_seconds)
 
     def merge_chunks(items: list[list[dict]]) -> list[list[dict]]:
         merged: list[list[dict]] = []
@@ -175,7 +251,7 @@ def _build_sentence_cues(words: list[dict], max_cue_seconds: float) -> list[dict
     for sentence in sentences:
         chunks = _split_sentence_on_soft_pauses(sentence, max_cue_seconds)
         for chunk in chunks:
-            text = "".join(w["text"] for w in chunk).strip()
+            text = _chunk_text(chunk)
             cues.append(
                 {
                     "start": float(chunk[0]["start"]),
