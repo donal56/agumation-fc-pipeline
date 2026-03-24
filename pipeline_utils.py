@@ -333,6 +333,13 @@ def qc_check_srt(path: str) -> list[str]:
     return problems
 
 
+def is_empty_text_file(path: str) -> bool:
+    try:
+        return Path(path).read_text(encoding="utf8").strip() == ""
+    except Exception:
+        return False
+
+
 def _openai_call(messages: list[dict[str, str]], model: str, temperature: float) -> str:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:

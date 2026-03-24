@@ -3,7 +3,6 @@ import shutil
 
 import pipeline_utils as pu
 
-
 def stage_hardsub():
 
     print("\nSTAGE: HARDSUB\n")
@@ -12,13 +11,8 @@ def stage_hardsub():
         if not f.is_file():
             break
 
-        if not f.name.lower().endswith(pu.VIDEO_EXT):
-            pu.log_file_status("hardsub", f.name, "Skipped", "Unsupported extension")
-            continue
         pu.log_file_start("hardsub", f.name)
-
         raw_name = os.path.splitext(f.name)[0]
-
         video = None
 
         for ext in pu.VIDEO_EXT:
@@ -39,26 +33,20 @@ def stage_hardsub():
             pu.log_file_status("hardsub", f.name, "Skipped", "Already generated")
             continue
 
-        def copy_video(reason: str) -> None:
-            try:
-                shutil.copyfile(video, out)
-                pu.log_file_status("hardsub", f.name, "Success", reason)
-            except Exception as err:
-                pu.log_file_status("hardsub", f.name, "Failed", str(err))
-
-        if pu.is_silent_source_case(raw_name):
-            copy_video("Silent source, copied without subtitles")
-            continue
-
         srt_filename = raw_name + ".srt"
         srt1 = os.path.join(pu.EN, srt_filename)
         srt2 = os.path.join(pu.ES, srt_filename)
+        qc =  os.path.join(pu.QC, raw_name + ".txt")
+        
         if not os.path.exists(srt1) or not os.path.exists(srt2):
-            pu.log_file_status("hardsub", f.name, "Skipped", "Missing translated subtitles")
-            continue
-        if not pu.read_srt(srt1) and not pu.read_srt(srt2):
-            copy_video("Both translated subtitles empty, copied without subtitles")
-            continue
+            if not os.path.exists(srt1) and not os.path.exists(srt2) and os.path.exists(qc) and pu.is_empty_text_file(qc):
+                shutil.copyfile(video, out)
+                pu.log_file_status("hardsub", f.name, "Skipped", "Both translated subtitles empty, copied without subtitles")
+                continue
+            else:
+                pu.log_file_status("hardsub", f.name, "Skipped", "Missing translated subtitles")
+                continue
+
         try:
             ok, detail = pu.hardsub(video, srt1, srt2, out)
             if ok:
