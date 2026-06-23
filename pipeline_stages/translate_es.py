@@ -15,7 +15,7 @@ def stage_translate_es():
 
     for f in os.scandir(pu.JP):
         if not f.is_file():
-            break
+            continue
 
         if not f.name.lower().endswith(".srt"):
             pu.log_file_status("translate_es", f.name, "Skipped", "unsupported extension")

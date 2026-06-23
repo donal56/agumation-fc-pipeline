@@ -80,3 +80,9 @@ The final videos will be available in `/pipeline/5_output`.
 ## Customization
 
 To adapt translation quality/style, tune OpenAI settings in `.env.local`.
+
+### Transcribe Stage Options
+
+- **`SRT_MAX_CUE_SECONDS`** (default: 6.0): Maximum duration for a subtitle cue. Splits longer sentences into multiple cues. Set to 0 to disable splitting.
+
+- **`SRT_AFTER_CUE_SILENCE_MS`** (default: 300): Post-processing option that adds silence padding to the end of subtitle cue timestamps. This creates more natural reading pacing by adding up to this many milliseconds of silence after each cue, without overlapping with the next cue. Set to 0 to disable this feature.

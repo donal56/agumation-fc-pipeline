@@ -425,22 +425,61 @@ def _translate_texts(
     source_lang: str, target_lang: str, texts: list[str]
 ) -> list[str]:
     model_name = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini").strip()
-    batch_limit = max(500, get_env_int("OPENAI_BATCH_CHARS", 4000))
+    # Default batch limit: 3000 chars (empirically tuned)
+    # - Original 4000 caused API truncation (batch of 149 returned only 141)
+    # - 2000 was too conservative, limiting throughput
+    # - 3000 provides good balance; recursive splitting handles overflow
+    batch_limit = get_env_int("OPENAI_BATCH_CHARS", 3000)
     translated: list[str] = []
 
-    def translate_batch(batch: list[str]) -> list[str]:
+    def translate_batch(batch: list[str], attempt: int = 1) -> list[str]:
         messages = _build_translation_prompt(source_lang, target_lang, batch)
         content = _openai_call(messages, model_name, temperature=0.2)
+        
+        # Try JSON parsing
         try:
             data = json.loads(content)
-            if isinstance(data, list) and len(data) == len(batch):
-                return [str(x) for x in data]
-        except Exception:
+            if isinstance(data, list):
+                import sys
+                if len(data) == len(batch):
+                    print(f"[DEBUG] Batch {attempt}: SUCCESS with {len(data)} items", file=sys.stderr)
+                    return [str(x) for x in data]
+                elif len(data) > 0:
+                    # Partial response - try to recover
+                    print(f"[DEBUG] Batch {attempt}: Partial response {len(data)}/{len(batch)}, retrying with smaller batch", file=sys.stderr)
+                    # Split the batch and retry
+                    if len(batch) > 2:
+                        # Translate what we got
+                        result = [str(x) for x in data]
+                        # Retry the rest
+                        remaining = batch[len(data):]
+                        result.extend(translate_batch(remaining, attempt + 1))
+                        return result
+        except json.JSONDecodeError:
             pass
+        except Exception as e:
+            import sys
+            print(f"[DEBUG] Error during JSON parsing: {e}", file=sys.stderr)
+        
+        # Try line-by-line parsing
         lines = [line.strip() for line in content.splitlines() if line.strip()]
         if len(lines) == len(batch):
             return lines
-        raise RuntimeError("OpenAI response could not be parsed as expected JSON.")
+        
+        # If we're here and batch is large, try splitting
+        if len(batch) > 2:
+            import sys
+            print(f"[DEBUG] Batch {attempt}: Standard parsing failed ({len(lines)} lines vs {len(batch)} expected), splitting and retrying", file=sys.stderr)
+            mid = len(batch) // 2
+            first_half = translate_batch(batch[:mid], attempt + 1)
+            second_half = translate_batch(batch[mid:], attempt + 1)
+            return first_half + second_half
+        
+        # Error case - batch is too small to split further
+        error_msg = f"OpenAI response could not be parsed as expected JSON. (Got {len(lines)} lines, expected {len(batch)})"
+        import sys
+        print(f"\n[ERROR] {error_msg}", file=sys.stderr)
+        raise RuntimeError(error_msg)
 
     current: list[str] = []
     current_len = 0

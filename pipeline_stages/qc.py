@@ -9,7 +9,7 @@ def stage_qc():
 
     for f in os.scandir(pu.JP):
         if not f.is_file():
-            break
+            continue
         
         if not f.name.lower().endswith(".srt"):
             pu.log_file_status("qc", f.name, "Skipped", "Unsupported extension")

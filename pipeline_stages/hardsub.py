@@ -9,7 +9,7 @@ def stage_hardsub():
 
     for f in os.scandir(pu.JP):
         if not f.is_file():
-            break
+            continue
 
         pu.log_file_start("hardsub", f.name)
         raw_name = os.path.splitext(f.name)[0]

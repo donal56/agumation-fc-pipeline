@@ -293,11 +293,81 @@ def _merge_adjacent_cues(cues: list[dict], max_cue_seconds: float) -> list[dict]
     return merged
 
 
+def _add_cue_silence(cues: list[dict], silence_ms: float) -> list[dict]:
+    """Add silence padding to the end of each cue without colliding with the next cue.
+    
+    Args:
+        cues: List of cue dictionaries with 'start', 'end', and 'text' keys
+        silence_ms: Maximum silence to add in milliseconds
+    
+    Returns:
+        Modified list of cues with extended end timestamps
+    """
+    if not cues or silence_ms <= 0:
+        return cues
+    
+    silence_seconds = silence_ms / 1000.0
+    result = []
+    
+    for idx, cue in enumerate(cues):
+        cue_copy = cue.copy()
+        
+        # For all cues except the last one, try to add silence
+        if idx < len(cues) - 1:
+            next_cue_start = float(cues[idx + 1]["start"])
+            current_end = float(cue_copy["end"])
+            available_gap = next_cue_start - current_end
+            
+            # Add silence up to the limit, but don't exceed available gap
+            silence_to_add = min(silence_seconds, available_gap)
+            if silence_to_add > 0:
+                cue_copy["end"] = current_end + silence_to_add
+        
+        result.append(cue_copy)
+    
+    return result
+
+
+def _merge_short_cues(cues: list[dict]) -> list[dict]:
+    """Merge cues with 4 or fewer characters with the preceding cue.
+    
+    Prevents short cues like isolated punctuation and single/few characters from creating 
+    standalone cues by merging them with the previous cue's text while updating the 
+    previous cue's end time.
+    
+    Args:
+        cues: List of cue dictionaries with 'start', 'end', and 'text' keys
+    
+    Returns:
+        Modified list of cues with short cues merged into preceding cues
+    """
+    if not cues:
+        return cues
+    
+    result = []
+    
+    for idx, cue in enumerate(cues):
+        cue_text = cue.get("text", "").strip()
+        
+        # Check if this is a short cue (4 or fewer chars) and not the first cue
+        if idx > 0 and len(cue_text) <= 4:
+            # Merge with the previous cue
+            prev_cue = result[-1]
+            prev_cue["text"] = f'{prev_cue["text"]}{cue_text}'
+            prev_cue["end"] = float(cue["end"])
+        else:
+            # Keep this cue as-is
+            result.append(cue.copy())
+    
+    return result
+
+
 def stage_transcribe():
 
     print("\nSTAGE: TRANSCRIBE\n")
     pu.load_local_env()
     max_cue_seconds = max(0.0, pu.get_env_float("SRT_MAX_CUE_SECONDS", 6.0))
+    after_cue_silence_ms = max(0.0, pu.get_env_float("SRT_AFTER_CUE_SILENCE_MS", 300.0))
     use_word_timestamps = True
 
     if pu.model is None:
@@ -365,6 +435,8 @@ def stage_transcribe():
             for segment in segment_list:
                 words.extend(_segment_words(segment))
             cues = _build_sentence_cues(words, max_cue_seconds)
+            cues = _add_cue_silence(cues, after_cue_silence_ms)
+            cues = _merge_short_cues(cues)
             pu.write_srt(cues, jp_path)
             pu.log_file_status("transcribe", f, "Success")
         except Exception as err:

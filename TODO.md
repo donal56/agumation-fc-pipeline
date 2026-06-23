@@ -2,3 +2,4 @@
 - Add helper command to clear a file from the pipeline
 - Split cue if it contains an ellipsis #71
 - Add colors on cli
+- add second qc check after translate_en ?
